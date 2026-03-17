@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # DGmeshPlayer
 DG-Mesh Dynamic Gaussian / Mesh Player and Export Tools
 =======
@@ -238,4 +237,3 @@ frame_0002.ply
 ---
 
 最后，感谢[DG-mesh](https://github.com/Isabella98Liu/DG-Mesh)的作者及代码
->>>>>>> master
