@@ -7,7 +7,12 @@ DG-Mesh Dynamic Gaussian / Mesh Player and Export Tools
 [English Version](./README_EN.md)
 
 ---
-tips:新的分支使用了react嵌入qt
+tips:新的分支使用了react嵌入qt，所以需要先
+```bash
+cd player_frontend
+npm install
+npm run build
+```
 ---
 ## 1. 项目定位
 
