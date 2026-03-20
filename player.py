@@ -24,6 +24,12 @@ import trimesh
 from plyfile import PlyData
 from PySide6 import QtCore, QtGui, QtWidgets
 
+try:
+    from PySide6 import QtWebChannel, QtWebEngineWidgets
+except Exception:  # pragma: no cover - runtime availability depends on local Qt install
+    QtWebChannel = None
+    QtWebEngineWidgets = None
+
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR.parent
@@ -35,7 +41,8 @@ if str(DG_ROOT) not in sys.path:
 import nvdiffrast.torch as dr
 
 from gaussian_renderer import render as gaussian_render
-from player_ui import RenderView, setup_main_window_ui
+from player_bridge import PlayerBridge
+from player_ui import RenderView, apply_main_window_theme, setup_main_window_ui
 from scene import GaussianModelDPSRDynamicAnchor as gaussian_model
 from scene import DeformModelNormal as deform_model
 from scene.cameras import MiniCam
@@ -50,6 +57,8 @@ FRAME_RE = re.compile(r"frame_(\d+)\.ply$", re.IGNORECASE)
 LOG_DIR = REPO_ROOT / "logs"
 LOG_PATH = LOG_DIR / "4dgsplayer.log"
 LOG_ENABLED = "--enable-log" in sys.argv
+FRONTEND_DIR = REPO_ROOT / "player_frontend"
+FRONTEND_ENTRY = FRONTEND_DIR / "dist" / "index.html"
 
 
 def log_message(message: str) -> None:
@@ -476,9 +485,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.orbit = OrbitCamera(target=np.array([0.0, 0.0, 0.0], dtype=np.float32), distance=2.5, yaw=35.0, pitch=10.0)
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.timeout.connect(self.advance_frame)
+        self.frontend_bridge: Optional[PlayerBridge] = None
+        self.frontend_channel = None
+        self.frontend_view = None
+        self.frontend_ready = False
+        self._frontend_sync_pending = False
+        self._last_emitted_ui_state: Optional[str] = None
+        self.sidebar_collapsed = False
+        self.sidebar_expanded_sizes = [1120, 480]
+        self.current_theme = "light"
 
         self._build_ui()
+        self._setup_frontend()
         self._bind_events()
+        self._update_sidebar_handle()
         self.on_mode_changed(self.mode_combo.currentText())
         self.recompute_frame_ids()
         self.render_current_frame()
@@ -486,6 +506,152 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_ui(self):
         setup_main_window_ui(self)
+        apply_main_window_theme(self, self.current_theme)
+        self.position_sidebar_handle()
+
+    def _setup_frontend(self):
+        if QtWebEngineWidgets is None or QtWebChannel is None:
+            self._show_legacy_frontend_fallback(
+                "PySide6 WebEngine/WebChannel is unavailable. Using legacy Qt controls."
+            )
+            return
+
+        if not FRONTEND_ENTRY.exists():
+            self._show_legacy_frontend_fallback(
+                f"Missing built frontend at {FRONTEND_ENTRY}. Build player_frontend first."
+            )
+            return
+
+        try:
+            self.frontend_bridge = PlayerBridge(self)
+            self.frontend_channel = QtWebChannel.QWebChannel(self)
+            self.frontend_channel.registerObject("playerBridge", self.frontend_bridge)
+
+            self.frontend_view = QtWebEngineWidgets.QWebEngineView(self.frontend_panel_host)
+            self.frontend_view.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.NoContextMenu)
+            self.frontend_view.page().setWebChannel(self.frontend_channel)
+            self.frontend_view.loadFinished.connect(
+                lambda ok: self.schedule_frontend_sync() if ok else self._show_legacy_frontend_fallback(
+                    "Failed to load the built React frontend. Falling back to legacy Qt controls."
+                )
+            )
+            self.frontend_panel_host.layout().insertWidget(0, self.frontend_view, 1)
+            self.frontend_view.load(QtCore.QUrl.fromLocalFile(str(FRONTEND_ENTRY.resolve())))
+            self.frontend_placeholder_label.hide()
+            self.legacy_controls_container.hide()
+            self.frontend_ready = True
+            log_message(f"Modern frontend loaded from {FRONTEND_ENTRY}")
+        except Exception as exc:
+            log_exception("Failed to initialize modern frontend", exc)
+            self._show_legacy_frontend_fallback(
+                "Modern frontend initialization failed. Using legacy Qt controls."
+            )
+
+    def _show_legacy_frontend_fallback(self, message: str):
+        self.frontend_ready = False
+        self.frontend_placeholder_label.setText(message)
+        self.frontend_placeholder_label.show()
+        self.legacy_controls_container.show()
+
+    def schedule_frontend_sync(self):
+        if self.frontend_bridge is None or self._frontend_sync_pending:
+            return
+        self._frontend_sync_pending = True
+        QtCore.QTimer.singleShot(0, self._flush_frontend_sync)
+
+    def _flush_frontend_sync(self):
+        self._frontend_sync_pending = False
+        if self.frontend_bridge is None:
+            return
+        state = self.get_ui_state()
+        state_json = json.dumps(state, ensure_ascii=False, sort_keys=True)
+        if state_json == self._last_emitted_ui_state:
+            return
+        self._last_emitted_ui_state = state_json
+        self.frontend_bridge.emit_event("stateChanged", state)
+
+    def get_ui_state(self) -> Dict[str, object]:
+        current_frame_id = self.get_active_frame_id()
+        gaussian_path = str(self.gaussian_sequence.root) if self.gaussian_sequence else self.gaussian_combo.currentText()
+        mesh_path = str(self.mesh_sequence.root) if self.mesh_sequence else self.mesh_combo.currentText()
+        online_path = str(self.online_gaussian_checkpoint_dir) if self.online_gaussian_checkpoint_dir else ""
+        return {
+            "mode": self.mode,
+            "playing": self.play_timer.isActive(),
+            "playLabel": self.play_button.text(),
+            "fps": int(self.fps_spin.value()),
+            "frameIndex": int(self.frame_slider.value()),
+            "frameCount": int(len(self.available_frame_ids)),
+            "currentFrameId": current_frame_id,
+            "status": self.status_label.text(),
+            "onlineGaussianEnabled": self.online_gaussian_check.isChecked(),
+            "onlineScale": float(self.online_scale_spin.value()),
+            "gaussianPath": gaussian_path,
+            "meshPath": mesh_path,
+            "onlineCheckpointPath": online_path,
+            "hasGaussianSequence": self.gaussian_sequence is not None,
+            "hasMeshSequence": self.mesh_sequence is not None,
+            "hasOnlineCheckpoint": self.online_gaussian_checkpoint_dir is not None,
+            "availableModeFrameCount": int(len(self.available_frame_ids)),
+            "theme": self.current_theme,
+        }
+
+    def set_theme(self, theme: str):
+        theme = "light" if theme == "light" else "dark"
+        if theme == self.current_theme:
+            return
+        self.current_theme = theme
+        apply_main_window_theme(self, self.current_theme)
+        self.schedule_frontend_sync()
+
+    def _move_frame_index(self, delta: int):
+        if not self.available_frame_ids:
+            return
+        next_index = max(0, min(self.frame_slider.value() + int(delta), len(self.available_frame_ids) - 1))
+        self.frame_slider.setValue(next_index)
+
+    def handle_ui_command(self, command: Dict[str, object]) -> Dict[str, object]:
+        command_type = str(command.get("type", "")).strip()
+        payload = command.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if command_type == "togglePlayback":
+            self.toggle_playback()
+        elif command_type == "setMode":
+            mode = str(payload.get("mode", "")).strip()
+            if mode in {"Gaussian", "Mesh", "Split"}:
+                self.mode_combo.setCurrentText(mode)
+        elif command_type == "setFps":
+            fps = max(1, min(60, int(payload.get("fps", self.fps_spin.value()))))
+            self.fps_spin.setValue(fps)
+        elif command_type == "setFrameIndex":
+            if self.available_frame_ids:
+                index = max(0, min(int(payload.get("index", 0)), len(self.available_frame_ids) - 1))
+                self.frame_slider.setValue(index)
+        elif command_type == "stepFrame":
+            self._move_frame_index(int(payload.get("delta", 1)))
+        elif command_type == "setOnlineGaussianEnabled":
+            self.online_gaussian_check.setChecked(bool(payload.get("enabled", False)))
+        elif command_type == "setOnlineScale":
+            scale = float(payload.get("scale", self.online_scale_spin.value()))
+            scale = max(self.online_scale_spin.minimum(), min(self.online_scale_spin.maximum(), scale))
+            self.online_scale_spin.setValue(scale)
+        elif command_type == "chooseGaussianDir":
+            self.choose_gaussian_sequence_dir()
+        elif command_type == "chooseMeshDir":
+            self.choose_mesh_sequence_dir()
+        elif command_type == "chooseOnlineModelDir":
+            self.choose_online_checkpoint_dir()
+        elif command_type == "requestState":
+            pass
+        elif command_type == "setTheme":
+            self.set_theme(str(payload.get("theme", "dark")))
+        else:
+            raise ValueError(f"Unsupported command type: {command_type}")
+
+        self.schedule_frontend_sync()
+        return self.get_ui_state()
 
     def _bind_events(self):
         self.play_button.clicked.connect(self.toggle_playback)
@@ -500,10 +666,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fps_spin.valueChanged.connect(self.on_fps_changed)
         self.online_gaussian_check.toggled.connect(self.on_online_gaussian_toggled)
         self.online_scale_spin.valueChanged.connect(self.on_online_scale_changed)
+        self.sidebar_handle_button.clicked.connect(self.toggle_sidebar)
+        self.main_splitter.splitterMoved.connect(lambda *_: self.position_sidebar_handle())
         for view in (self.gaussian_view, self.mesh_view):
             view.orbit_changed.connect(self.on_orbit_changed)
             view.zoomed.connect(self.on_zoomed)
             view.resized.connect(self.render_current_frame)
+
+    def toggle_sidebar(self):
+        self.set_sidebar_collapsed(not self.sidebar_collapsed)
+
+    def set_sidebar_collapsed(self, collapsed: bool):
+        collapsed = bool(collapsed)
+        if collapsed == self.sidebar_collapsed:
+            return
+
+        if collapsed:
+            sizes = self.main_splitter.sizes()
+            if len(sizes) >= 2 and sizes[1] > 0:
+                self.sidebar_expanded_sizes = sizes
+            self.sidebar_panel.hide()
+            total = sum(sizes) if sizes else max(self.width(), 1)
+            self.main_splitter.setSizes([max(total, 1), 0])
+        else:
+            self.sidebar_panel.show()
+            sizes = self.sidebar_expanded_sizes if len(self.sidebar_expanded_sizes) >= 2 else [1120, 480]
+            self.main_splitter.setSizes(sizes)
+
+        self.sidebar_collapsed = collapsed
+        self._update_sidebar_handle()
+        self.position_sidebar_handle()
+
+    def _update_sidebar_handle(self):
+        self.sidebar_handle_button.setText("❮" if self.sidebar_collapsed else "❯")
+
+    def position_sidebar_handle(self):
+        handle = self.main_splitter.handle(1)
+        handle_rect = handle.geometry()
+        if not handle_rect.isValid():
+            return
+
+        button = self.sidebar_handle_button
+        top_left = handle.mapTo(self.centralWidget(), QtCore.QPoint(0, 0))
+        x = top_left.x() + max(0, (handle_rect.width() - button.width()) // 2)
+        y = top_left.y() + max(0, (self.main_splitter.height() - button.height()) // 2)
+        button.move(x, y)
+        button.raise_()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        self.position_sidebar_handle()
+
+    def showEvent(self, event: QtGui.QShowEvent):
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self.position_sidebar_handle)
 
     def dialog_directory(self, reference: Optional[Path] = None) -> str:
         if reference is not None and reference.exists():
@@ -534,6 +750,7 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.setCurrentText(key)
         self.path_dialog_root = directory
         log_message(f"Registered {kind} sequence: {directory}")
+        self.schedule_frontend_sync()
         return True
 
     def current_gaussian_sequence(self) -> Optional[SequenceInfo]:
@@ -638,6 +855,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_online_scale_changed(self, _: float):
         if self.online_gaussian_check.isChecked():
             self.render_current_frame()
+        else:
+            self.schedule_frontend_sync()
 
     def ensure_online_gaussian_backend(self) -> Optional[OnlineGaussianBackend]:
         if self.online_gaussian_backend is not None:
@@ -665,8 +884,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_mode_changed(self, mode: str):
         self.mode = mode
+        show_gaussian = mode in {"Gaussian", "Split"}
+        show_mesh = mode in {"Mesh", "Split"}
         self.gaussian_view.setVisible(mode in {"Gaussian", "Split"})
         self.mesh_view.setVisible(mode in {"Mesh", "Split"})
+        self.gaussian_card.setVisible(show_gaussian)
+        self.mesh_card.setVisible(show_mesh)
         self.render_container.setVisible(True)
         self.frame_slider.setEnabled(True)
         self.frame_spin.setEnabled(True)
@@ -714,6 +937,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("请先选择 Online Model Dir 或 Gaussian / Mesh 序列目录")
         else:
             self.status_label.setText("No overlapping frames for current mode")
+        self.schedule_frontend_sync()
 
     def on_slider_changed(self, value: int):
         self.frame_spin.blockSignals(True)
@@ -730,6 +954,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_fps_changed(self, value: int):
         if self.play_timer.isActive():
             self.play_timer.start(max(1, int(1000 / value)))
+        self.schedule_frontend_sync()
 
     def toggle_playback(self):
         if self.play_timer.isActive():
@@ -738,6 +963,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.play_timer.start(max(1, int(1000 / self.fps_spin.value())))
             self.play_button.setText("Pause")
+        self.schedule_frontend_sync()
 
     def advance_frame(self):
         if not self.available_frame_ids:
@@ -823,6 +1049,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if frame_id is None:
             self.gaussian_view.setText("No Gaussian frame")
             self.mesh_view.setText("No Mesh frame")
+            self.schedule_frontend_sync()
             return
 
         log_message(f"render_current_frame frame_id={frame_id}")
@@ -858,6 +1085,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 log_exception(f"Mesh render failed for frame {frame_id}", exc)
                 self.mesh_view.clear()
                 self.mesh_view.setText(f"Mesh render failed: {frame_id}")
+        self.schedule_frontend_sync()
 
     def gaussian_render_resolution(self, render_scale: float = 1.0) -> tuple[int, int, int, int]:
         view_width = max(64, self.gaussian_view.width())

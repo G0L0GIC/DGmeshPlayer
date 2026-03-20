@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # DGmeshPlayer
 DG-Mesh Dynamic Gaussian / Mesh Player and Export Tools
 =======
@@ -7,7 +7,8 @@ DG-Mesh Dynamic Gaussian / Mesh Player and Export Tools
 [English Version](./README_EN.md)
 
 ---
-
+tips:新的分支使用了react嵌入qt
+---
 ## 1. 项目定位
 
 这个仓库目前是一个 **围绕 DG-Mesh 的轻量功能仓库**，主要包含两部分：
@@ -238,4 +239,4 @@ frame_0002.ply
 ---
 
 最后，感谢[DG-mesh](https://github.com/Isabella98Liu/DG-Mesh)的作者及代码
->>>>>>> master
+
